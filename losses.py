@@ -14,6 +14,10 @@ class FocalLoss(nn.Module):
 
     Reference: Lin et al. "Focal Loss for Dense Object Detection" (2017)
     LESPS uses: alpha=2.0, gamma=4.0 for infrared small target detection.
+
+    Key difference from standard Focal Loss:
+    - Normalization by POSITIVE SAMPLES only, not total pixels
+    - This prevents gradient dilution in extremely imbalanced scenarios
     """
     def __init__(self, alpha: float = 2.0, gamma: float = 4.0, eps: float = 1e-12) -> None:
         super().__init__()
@@ -23,13 +27,20 @@ class FocalLoss(nn.Module):
 
     def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
         probs = torch.sigmoid(logits)
+
+        # LESPS-style focal loss computation
         pos_weights = targets
         neg_weights = (1 - targets).pow(self.gamma)
 
         pos_loss = -(probs + self.eps).log() * (1 - probs).pow(self.alpha) * pos_weights
         neg_loss = -(1 - probs + self.eps).log() * probs.pow(self.alpha) * neg_weights
 
-        return (pos_loss + neg_loss).mean()
+        loss = pos_loss + neg_loss
+
+        # 🔑 KEY FIX: Normalize by positive samples only (LEPS-style)
+        # This prevents gradient dilution in extremely imbalanced scenarios
+        avg_factor = targets.eq(1).sum().clamp_min(1)
+        return loss.sum() / avg_factor
 
 
 class PointSupervisionLoss(nn.Module):
