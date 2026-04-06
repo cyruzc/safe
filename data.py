@@ -479,7 +479,7 @@ class IRSTDPointDataset(Dataset):
                 loaded_point_label = (
                     crop_reference if crop_reference_name == "loaded_point_label" else cropped_map["loaded_point_label"]
                 )
-            point_map = crop_reference if crop_reference_name == "point_map" else cropped_map["point_map"]
+            point_map = cropped_map["point_map"] if crop_reference_name == "point_map" else crop_reference
             if inner_prior is not None:
                 inner_prior = crop_reference if crop_reference_name == "inner_prior" else cropped_map["inner_prior"]
             if outer_prior is not None:

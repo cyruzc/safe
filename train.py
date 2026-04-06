@@ -461,6 +461,10 @@ def main() -> None:
             f"model={args.model_name} method={method_name} seed={args.seed}"
         )
         for epoch in range(1, args.epochs + 1):
+            # Update learning rate at the start of each epoch (after optimizer.step() has been called in previous epoch)
+            if scheduler is not None and epoch > 1:
+                scheduler.step()
+
             print(f"epoch={epoch:03d} start", flush=True)
             train_stats = train_one_epoch(
                 model,
@@ -524,9 +528,6 @@ def main() -> None:
             else:
                 message += " val=skipped"
             print(message, flush=True)
-
-            if scheduler is not None:
-                scheduler.step()
 
     best_checkpoint_path = output_dir / "best_iou.pt"
     if not best_checkpoint_path.exists():
