@@ -4,6 +4,7 @@ import argparse
 import json
 
 import torch
+import torch.nn.functional
 from torch.amp import autocast
 from torch.utils.data import DataLoader
 
@@ -77,12 +78,22 @@ def main() -> None:
             with autocast(device_type=device.type, enabled=use_amp):
                 logits = model(image)
             prob = torch.sigmoid(logits)
-            if prob.shape[-2] != orig_h or prob.shape[-1] != orig_w:
-                prob = prob[:, :, :orig_h, :orig_w]
 
-            mask_tensor = batch["mask"]
-            metrics.update_pixel(prob, mask_tensor.to(device, non_blocking=True))
-            metrics.update_pd_fa(prob[0, 0].cpu().numpy(), mask_tensor[0, 0].numpy())
+            # Ensure output matches original input size
+            if prob.shape[-2:] != (orig_h, orig_w):
+                prob = torch.nn.functional.interpolate(
+                    prob, size=(orig_h, orig_w), mode='bilinear', align_corners=False
+                )
+
+            # Get ground truth and ensure it matches prediction size
+            mask_tensor = batch["mask"].to(device, non_blocking=True)
+            if mask_tensor.shape[-2:] != (orig_h, orig_w):
+                mask_tensor = torch.nn.functional.interpolate(
+                    mask_tensor, size=(orig_h, orig_w), mode='nearest'
+                )
+
+            metrics.update_pixel(prob, mask_tensor)
+            metrics.update_pd_fa(prob[0, 0].cpu().numpy(), mask_tensor[0, 0].cpu().numpy())
 
     result = metrics.get_results()
     print(json.dumps(result, indent=2, sort_keys=True))

@@ -19,6 +19,7 @@ experiments/
 skills/
 paper/
 runs/
+scripts/
 
 # Datasets (large files)
 Dataset.zip

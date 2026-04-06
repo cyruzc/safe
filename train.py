@@ -8,6 +8,7 @@ from pathlib import Path
 
 import numpy as np
 import torch
+import torch.nn.functional
 from torch.amp import GradScaler, autocast
 from torch.utils.data import DataLoader
 
@@ -20,7 +21,9 @@ from models import build_model as build_model_from_registry, get_default_channel
 
 def parse_args() -> argparse.Namespace:
     model_choices = get_model_names()
-    parser = argparse.ArgumentParser(description="Train SAFE and point/full IRSTD models")
+    parser = argparse.ArgumentParser(
+        description="Train SAFE (Self-Adaptive prior-enhanced weak supervision), point, and full IRSTD models"
+    )
     parser.add_argument("--dataset-name", type=str, choices=["sirst3", "irstd1k", "nuaa_sirst", "nudt_sirst"], default=None)
     parser.add_argument("--label-mode", type=str, choices=["centroid", "coarse"], default=None)
     parser.add_argument("--dataset-root", type=str, default=None)
@@ -53,8 +56,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--point-sigma", type=float, default=2.0)
     parser.add_argument("--focus-prob", type=float, default=0.7)
     parser.add_argument("--batch-size", type=int, default=16)
-    parser.add_argument("--epochs", type=int, default=30)
-    parser.add_argument("--lr", type=float, default=2.5e-3)
+    parser.add_argument("--epochs", type=int, default=300)
+    parser.add_argument("--lr", type=float, default=5e-4)  # LESPS-validated learning rate
     parser.add_argument("--weight-decay", type=float, default=1e-4)
     parser.add_argument("--num-workers", type=int, default=6)
     parser.add_argument("--seed", type=int, default=42)
@@ -68,6 +71,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--pos-weight", type=float, default=10.0)
     parser.add_argument("--positive-threshold", type=float, default=0.5)
     parser.add_argument("--full-pos-weight", type=float, default=1.0)
+    parser.add_argument("--loss-type", type=str, choices=["bce", "focal"], default="focal", help="Loss function type: bce (weighted BCE) or focal (LESPS-style)")
     parser.add_argument("--inner-loss-weight", type=float, default=0.0)
     parser.add_argument("--outer-loss-weight", type=float, default=0.0)
     parser.add_argument("--prior-warmup-epochs", type=int, default=0)
@@ -76,11 +80,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--outer-boost-start-epoch", type=int, default=None)
     parser.add_argument("--outer-boost-end-epoch", type=int, default=None)
     parser.add_argument("--outer-boost-scale", type=float, default=1.0)
-    parser.add_argument("--scheduler", type=str, choices=["none", "cosine"], default="none", help="LR scheduler.")
+    parser.add_argument("--scheduler", type=str, choices=["none", "cosine"], default="cosine", help="LR scheduler.")
     parser.add_argument("--eta-min", type=float, default=1e-6, help="Minimum LR for cosine scheduler.")
     parser.add_argument("--eval-every", type=int, default=1, help="Run IoU validation every N epochs.")
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
-    parser.add_argument("--amp", action="store_true", help="Enable automatic mixed precision on CUDA")
+    parser.add_argument(
+        "--amp",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Enable automatic mixed precision on CUDA",
+    )
     return parser.parse_args()
 
 
@@ -157,21 +166,35 @@ def evaluate(
 ) -> dict[str, float]:
     model.eval()
     metrics = BasicIRSTDMetrics(thresholds=thresholds)
-    for batch in loader:
+    for batch_idx, batch in enumerate(loader):
         raw_image = batch["image"].to(device, non_blocking=True)
         orig_h, orig_w = raw_image.shape[-2], raw_image.shape[-1]
         image = prepare_model_input(raw_image, model_name)
         with autocast(device_type=device.type, enabled=use_amp):
             logits = model(image)
         prob = torch.sigmoid(logits)
-        # Crop back to original size if padding was applied
-        if prob.shape[-2] != orig_h or prob.shape[-1] != orig_w:
-            prob = prob[:, :, :orig_h, :orig_w]
 
-        mask_tensor = batch["mask"]
-        metrics.update_pixel(prob, mask_tensor.to(device, non_blocking=True))
+        # Ensure output matches original input size
+        if prob.shape[-2:] != (orig_h, orig_w):
+            prob = torch.nn.functional.interpolate(
+                prob, size=(orig_h, orig_w), mode='bilinear', align_corners=False
+            )
+
+        # Get ground truth and ensure it matches prediction size
+        mask_tensor = batch["mask"].to(device, non_blocking=True)
+        if mask_tensor.shape[-2:] != (orig_h, orig_w):
+            mask_tensor = torch.nn.functional.interpolate(
+                mask_tensor, size=(orig_h, orig_w), mode='nearest'
+            )
+
+        # Safety check for valid predictions
+        if torch.isnan(prob).any() or torch.isinf(prob).any():
+            print(f"Warning: Invalid predictions in batch {batch_idx}, skipping...")
+            continue
+
+        metrics.update_pixel(prob, mask_tensor)
         if compute_object_metrics:
-            metrics.update_pd_fa(prob[0, 0].cpu().numpy(), mask_tensor[0, 0].numpy())
+            metrics.update_pd_fa(prob[0, 0].cpu().numpy(), mask_tensor[0, 0].cpu().numpy())
     return metrics.get_results(include_object_metrics=compute_object_metrics)
 
 
@@ -187,21 +210,47 @@ def evaluate_iou_only(
     model.eval()
     total_inter = 0.0
     total_union = 0.0
-    for batch in loader:
+    for batch_idx, batch in enumerate(loader):
         raw_image = batch["image"].to(device, non_blocking=True)
         orig_h, orig_w = raw_image.shape[-2], raw_image.shape[-1]
         image = prepare_model_input(raw_image, model_name)
         with autocast(device_type=device.type, enabled=use_amp):
             logits = model(image)
         prob = torch.sigmoid(logits)
-        if prob.shape[-2] != orig_h or prob.shape[-1] != orig_w:
-            prob = prob[:, :, :orig_h, :orig_w]
+
+        # Ensure output matches original input size
+        if prob.shape[-2:] != (orig_h, orig_w):
+            prob = torch.nn.functional.interpolate(
+                prob, size=(orig_h, orig_w), mode='bilinear', align_corners=False
+            )
+
+        # Get ground truth and ensure it matches prediction size
+        gt_mask = batch["mask"].to(device, non_blocking=True)
+        if gt_mask.shape[-2:] != (orig_h, orig_w):
+            gt_mask = torch.nn.functional.interpolate(
+                gt_mask, size=(orig_h, orig_w), mode='nearest'
+            )
 
         pred_bin = prob > threshold
-        gt_bin = batch["mask"].to(device, non_blocking=True) > 0
-        total_inter += float((pred_bin & gt_bin).sum().item())
-        total_union += float((pred_bin | gt_bin).sum().item())
-    return (total_inter / total_union * 100.0) if total_union > 0 else 0.0
+        gt_bin = gt_mask > 0
+
+        # Safety checks
+        batch_inter = float((pred_bin & gt_bin).sum().item())
+        batch_union = float((pred_bin | gt_bin).sum().item())
+
+        # Skip invalid batches
+        if batch_union == 0 or batch_inter > batch_union or not torch.isfinite(torch.tensor(batch_inter)):
+            continue
+
+        total_inter += batch_inter
+        total_union += batch_union
+
+    # Ensure valid IoU calculation
+    if total_union == 0 or not torch.isfinite(torch.tensor(total_inter)) or not torch.isfinite(torch.tensor(total_union)):
+        return 0.0
+
+    iou = (total_inter / total_union * 100.0)
+    return min(iou, 100.0)  # Cap at 100%
 
 
 def train_one_epoch(
@@ -218,8 +267,7 @@ def train_one_epoch(
 ) -> dict[str, float]:
     model.train()
     totals = {
-        "train_loss": 0.0,
-        "point_loss": 0.0,
+        "loss": 0.0,
         "inner_loss": 0.0,
         "outer_loss": 0.0,
     }
@@ -249,7 +297,7 @@ def train_one_epoch(
                 mask = batch["mask"].to(device, non_blocking=True)
                 loss = criterion(logits, mask)
                 stats = {
-                    "point_loss": float(loss.detach().item()),
+                    "loss": float(loss.detach().item()),
                     "inner_loss": 0.0,
                     "outer_loss": 0.0,
                 }
@@ -258,8 +306,9 @@ def train_one_epoch(
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         scaler.step(optimizer)
         scaler.update()
-        totals["train_loss"] += float(loss.item())
-        totals["point_loss"] += stats["point_loss"]
+
+        # Accumulate loss components
+        totals["loss"] += stats["loss"]
         totals["inner_loss"] += stats["inner_loss"]
         totals["outer_loss"] += stats["outer_loss"]
 
@@ -323,7 +372,7 @@ def main() -> None:
     if args.method == "full" and args.label_mode is not None:
         raise ValueError("--label-mode is not used with --method full.")
     if args.method == "full" and (args.inner_loss_weight > 0 or args.outer_loss_weight > 0):
-        raise ValueError("Tri-zone prior losses are only supported with --method point or --method safe.")
+        raise ValueError("Tri-zone prior losses are only supported with --method point or --method safe (SAFE method).")
     if args.method == "full" and args.use_loaded_point_labels:
         raise ValueError("--use-loaded-point-labels is only supported with --method point or --method safe.")
     if args.label_mode is not None and args.method == "full":
@@ -398,11 +447,12 @@ def main() -> None:
 
     best_iou = -1.0
     primary_iou_key = BasicIRSTDMetrics.primary_iou_key(args.eval_thresholds)
+
     history_path = output_dir / "history.csv"
     with history_path.open("w", newline="", encoding="utf-8") as file:
         writer = csv.DictWriter(
             file,
-            fieldnames=["epoch", "train_loss", "point_loss", "inner_loss", "outer_loss", primary_iou_key],
+            fieldnames=["epoch", "loss", "inner_loss", "outer_loss", primary_iou_key],
         )
         writer.writeheader()
 
@@ -424,19 +474,29 @@ def main() -> None:
                 prior_warmup_epochs=args.prior_warmup_epochs,
                 model_name=args.model_name,
             )
+            # Prepare CSV row
             row = {fieldname: "" for fieldname in writer.fieldnames if fieldname is not None}
-            row.update({"epoch": epoch, **train_stats})
+            row["epoch"] = epoch
+            row["loss"] = f"{train_stats['loss']:.4f}"
+            row["inner_loss"] = f"{train_stats['inner_loss']:.4f}"
+            row["outer_loss"] = f"{train_stats['outer_loss']:.4f}"
+
             ran_eval = should_run(epoch, args.eval_every) or epoch == args.epochs
             if ran_eval:
-                epoch_iou = evaluate_iou_only(
-                    model,
-                    test_loader,
-                    device,
-                    threshold=args.eval_thresholds[0],
-                    use_amp=use_amp,
-                    model_name=args.model_name,
-                )
-                row[primary_iou_key] = epoch_iou
+                try:
+                    epoch_iou = evaluate_iou_only(
+                        model,
+                        test_loader,
+                        device,
+                        threshold=args.eval_thresholds[0],
+                        use_amp=use_amp,
+                        model_name=args.model_name,
+                    )
+                    row[primary_iou_key] = f"{epoch_iou:.2f}"
+                except Exception as e:
+                    print(f"Warning: IoU calculation failed at epoch {epoch}: {e}")
+                    row[primary_iou_key] = "0.00"
+
             writer.writerow(row)
             file.flush()
 
@@ -455,8 +515,7 @@ def main() -> None:
 
             message = (
                 f"epoch={epoch:03d} "
-                f"loss={train_stats['train_loss']:.4f} "
-                f"point={train_stats['point_loss']:.4f} "
+                f"loss={train_stats['loss']:.4f} "
                 f"inner={train_stats['inner_loss']:.4f} "
                 f"outer={train_stats['outer_loss']:.4f}"
             )

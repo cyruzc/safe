@@ -9,31 +9,80 @@ from dataclasses import dataclass
 
 # ============ Loss Classes ============
 
+class FocalLoss(nn.Module):
+    """Focal Loss for addressing extreme class imbalance.
+
+    Reference: Lin et al. "Focal Loss for Dense Object Detection" (2017)
+    LESPS uses: alpha=2.0, gamma=4.0 for infrared small target detection.
+    """
+    def __init__(self, alpha: float = 2.0, gamma: float = 4.0, eps: float = 1e-12) -> None:
+        super().__init__()
+        self.alpha = alpha  # Modulating factor for positive samples
+        self.gamma = gamma  # Modulating factor for negative samples
+        self.eps = eps
+
+    def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        probs = torch.sigmoid(logits)
+        pos_weights = targets
+        neg_weights = (1 - targets).pow(self.gamma)
+
+        pos_loss = -(probs + self.eps).log() * (1 - probs).pow(self.alpha) * pos_weights
+        neg_loss = -(1 - probs + self.eps).log() * probs.pow(self.alpha) * neg_weights
+
+        return (pos_loss + neg_loss).mean()
+
+
 class PointSupervisionLoss(nn.Module):
-    def __init__(self, pos_weight: float = 10.0, positive_threshold: float = 0.5) -> None:
+    def __init__(self,
+                 pos_weight: float = 10.0,
+                 positive_threshold: float = 0.5,
+                 loss_type: str = "bce") -> None:
         super().__init__()
         self.pos_weight = pos_weight
         self.positive_threshold = positive_threshold
+        self.loss_type = loss_type
+
+        if loss_type == "focal":
+            self.focal_loss = FocalLoss(alpha=2.0, gamma=4.0)
 
     def forward(self, logits: torch.Tensor, point_targets: torch.Tensor) -> torch.Tensor:
-        weight = torch.ones_like(point_targets)
-        weight = torch.where(point_targets >= self.positive_threshold, self.pos_weight, weight)
-        return F.binary_cross_entropy_with_logits(logits, point_targets, weight=weight)
+        if self.loss_type == "focal":
+            return self.focal_loss(logits, point_targets)
+        else:  # BCE
+            weight = torch.ones_like(point_targets)
+            weight = torch.where(point_targets >= self.positive_threshold, self.pos_weight, weight)
+            return F.binary_cross_entropy_with_logits(logits, point_targets, weight=weight)
 
 
 class FullSupervisionLoss(nn.Module):
-    def __init__(self, pos_weight: float = 1.0) -> None:
+    def __init__(self, pos_weight: float = 1.0, loss_type: str = "bce") -> None:
         super().__init__()
         self.pos_weight = pos_weight
+        self.loss_type = loss_type
+
+        if loss_type == "focal":
+            self.focal_loss = FocalLoss(alpha=2.0, gamma=4.0)
 
     def forward(self, logits: torch.Tensor, mask_targets: torch.Tensor) -> torch.Tensor:
-        weight = torch.ones_like(mask_targets)
-        if self.pos_weight != 1.0:
-            weight = torch.where(mask_targets >= 0.5, self.pos_weight, weight)
-        return F.binary_cross_entropy_with_logits(logits, mask_targets, weight=weight)
+        if self.loss_type == "focal":
+            return self.focal_loss(logits, mask_targets)
+        else:  # BCE
+            weight = torch.ones_like(mask_targets)
+            if self.pos_weight != 1.0:
+                weight = torch.where(mask_targets >= 0.5, self.pos_weight, weight)
+            return F.binary_cross_entropy_with_logits(logits, mask_targets, weight=weight)
 
 
 class TriZonePartialLoss(nn.Module):
+    """Tri-Zone Partial Loss for SAFE method.
+
+    SAFE (Self-Adaptive ...) uses a three-zone approach:
+    1. Point zone: Direct point supervision
+    2. Inner prior zone: Encourages high probability near points
+    3. Outer prior zone: Encourages low probability in background regions
+
+    This implements the core technical innovation of the SAFE method.
+    """
     def __init__(
         self,
         point_loss: PointSupervisionLoss,
@@ -82,10 +131,9 @@ class TriZonePartialLoss(nn.Module):
 
         total = point_term + effective_inner_weight * inner_term + effective_outer_weight * outer_term
         stats = {
-            "point_loss": float(point_term.detach().item()),
+            "loss": float(total.detach().item()),
             "inner_loss": float(inner_term.detach().item()),
             "outer_loss": float(outer_term.detach().item()),
-            "total_loss": float(total.detach().item()),
             "effective_inner_weight": float(effective_inner_weight),
             "effective_outer_weight": float(effective_outer_weight),
         }
@@ -103,23 +151,27 @@ class MethodBundle:
 # ============ Factory Functions ============
 
 def resolve_method_name(args: argparse.Namespace) -> str:
+    # SAFE method uses tri-zone partial loss internally
     if args.method == "safe":
-        return "trizone"
+        return "safe"
     return args.method
 
 
 def build_criterion(args: argparse.Namespace, method_name: str) -> MethodBundle:
+    loss_type = getattr(args, 'loss_type', 'bce')  # Default to BCE for backward compatibility
+
     if method_name == "full":
         return MethodBundle(
             name="full",
-            criterion=FullSupervisionLoss(pos_weight=args.full_pos_weight),
+            criterion=FullSupervisionLoss(pos_weight=args.full_pos_weight, loss_type=loss_type),
         )
 
-    if method_name in {"point", "trizone"}:
+    if method_name in {"point", "safe"}:
         criterion = TriZonePartialLoss(
             point_loss=PointSupervisionLoss(
                 pos_weight=args.pos_weight,
                 positive_threshold=args.positive_threshold,
+                loss_type=loss_type,
             ),
             inner_weight=args.inner_loss_weight,
             outer_weight=args.outer_loss_weight,
@@ -138,10 +190,16 @@ def build_criterion(args: argparse.Namespace, method_name: str) -> MethodBundle:
 
 
 __all__ = [
+    "FocalLoss",
     "FullSupervisionLoss",
     "PointSupervisionLoss",
-    "TriZonePartialLoss",
+    "TriZonePartialLoss",  # Core implementation of SAFE method
     "MethodBundle",
     "resolve_method_name",
     "build_criterion",
 ]
+
+# Naming convention:
+# - SAFE: Project name and user-facing method name (--method safe)
+# - TriZone: Technical implementation details (TriZonePartialLoss class)
+# - This keeps API clean while preserving descriptive technical names
