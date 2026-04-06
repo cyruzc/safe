@@ -399,9 +399,12 @@ class IRSTDPointDataset(Dataset):
         if self.use_loaded_point_labels:
             if loaded_point_label is None:
                 raise ValueError("use_loaded_point_labels=True requires point_label_dir to provide labels.")
+            # 直接使用预加载的单点标签（masks_coarse/masks_centroid），不使用高斯模糊
             return loaded_point_label.astype(np.float32, copy=False)
+        # 从 full mask 提取中心点，生成纯单点（不使用高斯模糊）
         centers = component_centers(mask)
-        return gaussian_point_map(mask.shape, centers, self.point_sigma)
+        # 🔥 关闭高斯模糊：使用 sigma=0.0 生成纯单点
+        return gaussian_point_map(mask.shape, centers, sigma=0.0)
 
     def _load_sample_arrays(
         self,

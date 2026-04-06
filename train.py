@@ -133,7 +133,7 @@ def make_loader(
         outer_prior_dir=args.outer_prior_dir if train else None,
         crop_size=args.crop_size,
         point_sigma=args.point_sigma,
-        use_loaded_point_labels=(args.use_loaded_point_labels and args.method != "full" and (train or include_point_labels)),
+        use_loaded_point_labels=((args.use_loaded_point_labels or args.method == "point") and args.method != "full" and (train or include_point_labels)),
         train=train,
         focus_prob=args.focus_prob,
         seed=args.seed,
