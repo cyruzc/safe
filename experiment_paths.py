@@ -14,11 +14,26 @@ def format_percentile_tag(value: float) -> str:
     return str(value).replace(".", "")
 
 
-def resolve_supervision_tag(method: str, label_mode: str | None) -> str:
-    if method == "full":
+def resolve_supervision_tag(method: str, label_mode: str) -> str:
+    """Resolve supervision tag for experiment directory naming.
+
+    New orthogonal design:
+    - label-mode=full, method=none → "full"
+    - label-mode=centroid/coarse, method=none → "point_{label_mode}"
+    - label-mode=centroid/coarse, method=safe → "safe_{label_mode}"
+
+    Future:
+    - method=lesps → "lesps_{label_mode}"
+    - method=pal → "pal_{label_mode}"
+    """
+    if label_mode == "full":
+        if method != "none":
+            raise ValueError(f"label-mode=full only supports method=none, got '{method}'")
         return "full"
     if label_mode not in {"centroid", "coarse"}:
-        raise ValueError(f"Method '{method}' requires --label-mode to be one of: centroid, coarse.")
+        raise ValueError(f"label-mode must be one of: full, centroid, coarse. Got '{label_mode}'")
+    if method == "none":
+        return f"point_{label_mode}"
     return f"{method}_{label_mode}"
 
 

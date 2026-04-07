@@ -162,13 +162,33 @@ class MethodBundle:
 # ============ Factory Functions ============
 
 def resolve_method_name(args: argparse.Namespace) -> str:
-    # SAFE method uses tri-zone partial loss internally
+    """Resolve method name based on label-mode and method.
+
+    New orthogonal design:
+    - label-mode=full, method=none → "full" (full supervision)
+    - label-mode=centroid/coarse, method=none → "point" (point supervision baseline)
+    - label-mode=centroid/coarse, method=safe → "safe" (SAFE with tri-zone priors)
+    """
+    if args.label_mode == "full":
+        return "full"
     if args.method == "safe":
         return "safe"
-    return args.method
+    # label-mode=centroid/coarse + method=none → point supervision baseline
+    return "point"
 
 
 def build_criterion(args: argparse.Namespace, method_name: str) -> MethodBundle:
+    """Build loss criterion based on resolved method name.
+
+    Orthogonal CLI design:
+    - label-mode=full, method=none → FullSupervisionLoss
+    - label-mode=centroid/coarse, method=none → PointSupervisionLoss (via TriZonePartialLoss)
+    - label-mode=centroid/coarse, method=safe → TriZonePartialLoss with priors
+
+    Future extensions:
+    - method=lesps → LESPS-specific loss
+    - method=pal → PAL-specific loss
+    """
     loss_type = getattr(args, 'loss_type', 'bce')  # Default to BCE for backward compatibility
 
     if method_name == "full":

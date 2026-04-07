@@ -25,7 +25,7 @@ def parse_args() -> argparse.Namespace:
         description="Train SAFE (Self-Adaptive prior-enhanced weak supervision), point, and full IRSTD models"
     )
     parser.add_argument("--dataset-name", type=str, choices=["sirst3", "irstd1k", "nuaa_sirst", "nudt_sirst"], default=None)
-    parser.add_argument("--label-mode", type=str, choices=["centroid", "coarse"], default=None)
+    parser.add_argument("--label-mode", type=str, choices=["full", "centroid", "coarse"], default=None)
     parser.add_argument("--dataset-root", type=str, default=None)
     parser.add_argument("--output-dir", type=str, default=None, help="Optional explicit run directory.")
     parser.add_argument("--experiments-root", type=str, default="experiments", help="Root directory for auto-generated experiment paths.")
@@ -34,9 +34,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--method",
         type=str,
-        choices=["point", "safe", "full"],
-        default="point",
-        help="Training method.",
+        choices=["none", "safe"],
+        default="none",
+        help="Training method: none (baseline), safe (tri-zone priors). Future: lesps, pal.",
     )
     parser.add_argument("--image-dir-name", type=str, default=None, help="Advanced override. Prefer --dataset-name.")
     parser.add_argument("--mask-dir-name", type=str, default=None, help="Advanced override. Prefer --dataset-name.")
@@ -120,9 +120,15 @@ def make_loader(
 ) -> DataLoader:
     image_dir_name = dataset_config.train_image_dir if train else dataset_config.test_image_dir
     mask_dir_name = dataset_config.train_mask_dir if train else dataset_config.test_mask_dir
+
+    # For weak supervision (centroid/coarse), use pre-generated weak labels (masks_centroid/masks_coarse)
+    # This ensures: 1) Consistency across methods, 2) Proper use of coarse labels with offsets
+    use_weak_labels = args.label_mode in {"centroid", "coarse"} and (train or include_point_labels)
+
     point_label_dir = None
-    if args.method != "full" and (train or include_point_labels):
+    if use_weak_labels:
         point_label_dir = dataset_config.point_label_dir_for(args.label_mode) or args.point_label_dir
+
     dataset = IRSTDPointDataset(
         dataset_root=dataset_config.root,
         split_name=split_name,
@@ -133,7 +139,7 @@ def make_loader(
         outer_prior_dir=args.outer_prior_dir if train else None,
         crop_size=args.crop_size,
         point_sigma=args.point_sigma,
-        use_loaded_point_labels=((args.use_loaded_point_labels or args.method == "point") and args.method != "full" and (train or include_point_labels)),
+        use_loaded_point_labels=use_weak_labels,
         train=train,
         focus_prob=args.focus_prob,
         seed=args.seed,
@@ -366,17 +372,20 @@ def main() -> None:
         raise ValueError("--inner-prior-dir is required when --inner-loss-weight > 0.")
     if args.outer_loss_weight > 0 and args.outer_prior_dir is None:
         raise ValueError("--outer-prior-dir is required when --outer-loss-weight > 0.")
+    if args.label_mode is None:
+        raise ValueError("--label-mode is required. Choose from: full, centroid, coarse.")
     point_label_dir = dataset_config.point_label_dir_for(args.label_mode) or args.point_label_dir
     if args.use_loaded_point_labels and point_label_dir is None:
         raise ValueError("Point supervision with loaded weak labels requires a point-label directory or dataset label mode.")
-    if args.method == "full" and args.label_mode is not None:
-        raise ValueError("--label-mode is not used with --method full.")
-    if args.method == "full" and (args.inner_loss_weight > 0 or args.outer_loss_weight > 0):
-        raise ValueError("Tri-zone prior losses are only supported with --method point or --method safe (SAFE method).")
-    if args.method == "full" and args.use_loaded_point_labels:
-        raise ValueError("--use-loaded-point-labels is only supported with --method point or --method safe.")
-    if args.label_mode is not None and args.method == "full":
-        raise ValueError("--label-mode is only supported with --method point or --method safe.")
+    if args.label_mode == "full":
+        if args.method != "none":
+            raise ValueError("--label-mode=full only supports --method=none (full supervision baseline).")
+        if args.inner_loss_weight > 0 or args.outer_loss_weight > 0:
+            raise ValueError("Tri-zone prior losses are not supported with full supervision.")
+        if args.use_loaded_point_labels:
+            raise ValueError("--use-loaded-point-labels is not supported with full supervision.")
+    if args.method == "none" and (args.inner_loss_weight > 0 or args.outer_loss_weight > 0):
+        raise ValueError("Tri-zone prior losses require --method=safe.")
     if (args.inner_decay_start_epoch is None) != (args.inner_decay_end_epoch is None):
         raise ValueError("--inner-decay-start-epoch and --inner-decay-end-epoch must be set together.")
     if args.inner_decay_start_epoch is not None and args.inner_decay_end_epoch <= args.inner_decay_start_epoch:
