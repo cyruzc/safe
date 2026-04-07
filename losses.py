@@ -58,13 +58,31 @@ class PointSupervisionLoss(nn.Module):
         if loss_type == "focal":
             self.focal_loss = FocalLoss(alpha=2.0, gamma=4.0)
 
+    def _positive_only_focal(self, logits: torch.Tensor, point_targets: torch.Tensor) -> torch.Tensor:
+        probs = torch.sigmoid(logits)
+        positive_mask = (point_targets >= self.positive_threshold).float()
+        pos_loss = -(probs + self.focal_loss.eps).log() * (1 - probs).pow(self.focal_loss.alpha) * positive_mask
+        avg_factor = positive_mask.sum().clamp_min(1)
+        return pos_loss.sum() / avg_factor
+
+    def _positive_only_bce(self, logits: torch.Tensor, point_targets: torch.Tensor) -> torch.Tensor:
+        positive_mask = (point_targets >= self.positive_threshold).float()
+        positive_targets = torch.ones_like(point_targets)
+        positive_loss = F.binary_cross_entropy_with_logits(
+            logits,
+            positive_targets,
+            reduction="none",
+        )
+        avg_factor = positive_mask.sum().clamp_min(1)
+        return (positive_loss * positive_mask).sum() / avg_factor
+
     def forward(self, logits: torch.Tensor, point_targets: torch.Tensor) -> torch.Tensor:
         if self.loss_type == "focal":
-            return self.focal_loss(logits, point_targets)
+            # Partial-label point supervision: only labeled points are positive;
+            # unlabeled pixels are ignored rather than treated as background.
+            return self._positive_only_focal(logits, point_targets)
         else:  # BCE
-            weight = torch.ones_like(point_targets)
-            weight = torch.where(point_targets >= self.positive_threshold, self.pos_weight, weight)
-            return F.binary_cross_entropy_with_logits(logits, point_targets, weight=weight)
+            return self._positive_only_bce(logits, point_targets)
 
 
 class FullSupervisionLoss(nn.Module):
@@ -155,7 +173,7 @@ class TriZonePartialLoss(nn.Module):
             outer_forbidden = (outer_prior <= 0.5).float()
             outer_value = prob ** 2
             outer_mean = self._masked_mean(outer_value, outer_forbidden)
-            outer_term = self._point_normalized_masked_sum(outer_value, outer_forbidden, point_targets)
+            outer_term = outer_mean
 
         inner_weighted = effective_inner_weight * inner_term
         outer_weighted = effective_outer_weight * outer_term
