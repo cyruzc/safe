@@ -142,11 +142,16 @@ class TriZonePartialLoss(nn.Module):
             outer_forbidden = (outer_prior <= 0.5).float()
             outer_term = self._masked_mean(prob ** 2, outer_forbidden)
 
-        total = point_term + effective_inner_weight * inner_term + effective_outer_weight * outer_term
+        inner_weighted = effective_inner_weight * inner_term
+        outer_weighted = effective_outer_weight * outer_term
+        total = point_term + inner_weighted + outer_weighted
         stats = {
             "loss": float(total.detach().item()),
+            "main_loss": float(point_term.detach().item()),
             "inner_loss": float(inner_term.detach().item()),
             "outer_loss": float(outer_term.detach().item()),
+            "inner_weighted": float(inner_weighted.detach().item()),
+            "outer_weighted": float(outer_weighted.detach().item()),
             "effective_inner_weight": float(effective_inner_weight),
             "effective_outer_weight": float(effective_outer_weight),
         }

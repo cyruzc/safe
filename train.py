@@ -169,8 +169,11 @@ def train_one_epoch(
     model.train()
     totals = {
         "loss": 0.0,
+        "main_loss": 0.0,
         "inner_loss": 0.0,
         "outer_loss": 0.0,
+        "inner_weighted": 0.0,
+        "outer_weighted": 0.0,
     }
     use_prior_terms = epoch > prior_warmup_epochs
     inner_weight_scale = get_inner_weight_scale(criterion, epoch, prior_warmup_epochs)
@@ -199,16 +202,22 @@ def train_one_epoch(
                 loss = criterion(logits, point)
                 stats = {
                     "loss": float(loss.detach().item()),
+                    "main_loss": float(loss.detach().item()),
                     "inner_loss": 0.0,
                     "outer_loss": 0.0,
+                    "inner_weighted": 0.0,
+                    "outer_weighted": 0.0,
                 }
             else:
                 mask = batch["mask"].to(device, non_blocking=True)
                 loss = criterion(logits, mask)
                 stats = {
                     "loss": float(loss.detach().item()),
+                    "main_loss": float(loss.detach().item()),
                     "inner_loss": 0.0,
                     "outer_loss": 0.0,
+                    "inner_weighted": 0.0,
+                    "outer_weighted": 0.0,
                 }
         scaler.scale(loss).backward()
         scaler.unscale_(optimizer)
@@ -218,8 +227,11 @@ def train_one_epoch(
 
         # Accumulate loss components
         totals["loss"] += stats["loss"]
+        totals["main_loss"] += stats["main_loss"]
         totals["inner_loss"] += stats["inner_loss"]
         totals["outer_loss"] += stats["outer_loss"]
+        totals["inner_weighted"] += stats["inner_weighted"]
+        totals["outer_weighted"] += stats["outer_weighted"]
 
     denom = max(len(loader), 1)
     return {key: value / denom for key, value in totals.items()}
@@ -467,7 +479,16 @@ def main() -> None:
     with history_path.open("w", newline="", encoding="utf-8") as file:
         writer = csv.DictWriter(
             file,
-            fieldnames=["epoch", "loss", "inner_loss", "outer_loss", primary_iou_key],
+            fieldnames=[
+                "epoch",
+                "loss",
+                "main_loss",
+                "inner_loss",
+                "outer_loss",
+                "inner_weighted",
+                "outer_weighted",
+                primary_iou_key,
+            ],
         )
         writer.writeheader()
 
@@ -480,7 +501,6 @@ def main() -> None:
             if scheduler is not None and epoch > 1:
                 scheduler.step()
 
-            print(f"epoch={epoch:03d} start", flush=True)
             train_stats = train_one_epoch(
                 model,
                 train_loader,
@@ -497,8 +517,11 @@ def main() -> None:
             row = {fieldname: "" for fieldname in writer.fieldnames if fieldname is not None}
             row["epoch"] = epoch
             row["loss"] = f"{train_stats['loss']:.4f}"
+            row["main_loss"] = f"{train_stats['main_loss']:.4f}"
             row["inner_loss"] = f"{train_stats['inner_loss']:.4f}"
             row["outer_loss"] = f"{train_stats['outer_loss']:.4f}"
+            row["inner_weighted"] = f"{train_stats['inner_weighted']:.4f}"
+            row["outer_weighted"] = f"{train_stats['outer_weighted']:.4f}"
 
             ran_eval = should_run(epoch, args.eval_every) or epoch == args.epochs
             if ran_eval:
@@ -535,8 +558,11 @@ def main() -> None:
             message = (
                 f"epoch={epoch:03d} "
                 f"loss={train_stats['loss']:.4f} "
-                f"inner={train_stats['inner_loss']:.4f} "
-                f"outer={train_stats['outer_loss']:.4f}"
+                f"main={train_stats['main_loss']:.4f} "
+                f"inner_raw={train_stats['inner_loss']:.4f} "
+                f"inner_w={train_stats['inner_weighted']:.4f} "
+                f"outer_raw={train_stats['outer_loss']:.4f} "
+                f"outer_w={train_stats['outer_weighted']:.4f}"
             )
             if ran_eval:
                 message += f" {primary_iou_key}={epoch_iou:.2f}"
