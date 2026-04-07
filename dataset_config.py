@@ -92,6 +92,7 @@ DATASET_REGISTRY = {
 
 
 def build_dataset_config(args) -> DatasetConfig:
+    point_label_override = getattr(args, "point_label_dir", None)
     dataset_name = getattr(args, "dataset_name", None)
     if dataset_name:
         try:
@@ -125,13 +126,13 @@ def build_dataset_config(args) -> DatasetConfig:
         train_split=getattr(args, "train_split", None) or config.train_split,
         test_split=getattr(args, "test_split", None) or config.test_split,
         centroid_label_dir=(
-            getattr(args, "point_label_dir", None)
-            if getattr(args, "label_mode", None) == "centroid"
+            point_label_override
+            if getattr(args, "label_mode", None) == "centroid" and point_label_override is not None
             else config.centroid_label_dir
         ),
         coarse_label_dir=(
-            getattr(args, "point_label_dir", None)
-            if getattr(args, "label_mode", None) == "coarse"
+            point_label_override
+            if getattr(args, "label_mode", None) == "coarse" and point_label_override is not None
             else config.coarse_label_dir
         ),
     )
