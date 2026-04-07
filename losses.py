@@ -44,10 +44,12 @@ class FocalLoss(nn.Module):
 
 
 class PointSupervisionLoss(nn.Module):
-    def __init__(self,
-                 pos_weight: float = 10.0,
-                 positive_threshold: float = 0.5,
-                 loss_type: str = "bce") -> None:
+    def __init__(
+        self,
+        pos_weight: float = 10.0,
+        positive_threshold: float = 0.5,
+        loss_type: str = "bce",
+    ) -> None:
         super().__init__()
         self.pos_weight = pos_weight
         self.positive_threshold = positive_threshold
@@ -177,12 +179,20 @@ def resolve_method_name(args: argparse.Namespace) -> str:
     return "point"
 
 
+def build_point_supervision_loss(args: argparse.Namespace, loss_type: str) -> PointSupervisionLoss:
+    return PointSupervisionLoss(
+        pos_weight=args.pos_weight,
+        positive_threshold=args.positive_threshold,
+        loss_type=loss_type,
+    )
+
+
 def build_criterion(args: argparse.Namespace, method_name: str) -> MethodBundle:
     """Build loss criterion based on resolved method name.
 
     Orthogonal CLI design:
     - label-mode=full, method=none → FullSupervisionLoss
-    - label-mode=centroid/coarse, method=none → PointSupervisionLoss (via TriZonePartialLoss)
+    - label-mode=centroid/coarse, method=none → PointSupervisionLoss
     - label-mode=centroid/coarse, method=safe → TriZonePartialLoss with priors
 
     Future extensions:
@@ -197,13 +207,15 @@ def build_criterion(args: argparse.Namespace, method_name: str) -> MethodBundle:
             criterion=FullSupervisionLoss(pos_weight=args.full_pos_weight, loss_type=loss_type),
         )
 
-    if method_name in {"point", "safe"}:
+    if method_name == "point":
+        return MethodBundle(
+            name="point",
+            criterion=build_point_supervision_loss(args, loss_type),
+        )
+
+    if method_name == "safe":
         criterion = TriZonePartialLoss(
-            point_loss=PointSupervisionLoss(
-                pos_weight=args.pos_weight,
-                positive_threshold=args.positive_threshold,
-                loss_type=loss_type,
-            ),
+            point_loss=build_point_supervision_loss(args, loss_type),
             inner_weight=args.inner_loss_weight,
             outer_weight=args.outer_loss_weight,
             inner_decay_schedule=(
@@ -227,6 +239,7 @@ __all__ = [
     "TriZonePartialLoss",  # Core implementation of SAFE method
     "MethodBundle",
     "resolve_method_name",
+    "build_point_supervision_loss",
     "build_criterion",
 ]
 

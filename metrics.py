@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+from functools import lru_cache
+
 import numpy as np
 import torch
 
 
+@lru_cache(maxsize=1)
 def require_skimage_measure():
     try:
         from skimage import measure  # type: ignore

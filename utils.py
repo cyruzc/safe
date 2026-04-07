@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+from collections import deque
 from dataclasses import dataclass
+from functools import lru_cache
 from pathlib import Path
 
 import numpy as np
@@ -41,15 +43,48 @@ class SplitSummary:
     mean_outer_pixels: float
 
 
+def connected_components(mask: np.ndarray) -> list[np.ndarray]:
+    """Find connected components in a binary mask using 8-connectivity."""
+    binary = mask.astype(bool)
+    try:
+        cv2 = require_cv2()
+        num_labels, labels = cv2.connectedComponents(binary.astype(np.uint8), connectivity=8)
+        return [np.argwhere(labels == label).astype(np.int32) for label in range(1, num_labels)]
+    except ModuleNotFoundError:
+        visited = np.zeros(binary.shape, dtype=bool)
+        height, width = binary.shape
+        components: list[np.ndarray] = []
+        neighbors = [(-1, -1), (-1, 0), (-1, 1), (0, -1), (0, 1), (1, -1), (1, 0), (1, 1)]
+
+        for y in range(height):
+            for x in range(width):
+                if not binary[y, x] or visited[y, x]:
+                    continue
+                queue = deque([(y, x)])
+                visited[y, x] = True
+                pixels: list[tuple[int, int]] = []
+                while queue:
+                    cy, cx = queue.popleft()
+                    pixels.append((cy, cx))
+                    for dy, dx in neighbors:
+                        ny, nx = cy + dy, cx + dx
+                        if 0 <= ny < height and 0 <= nx < width and binary[ny, nx] and not visited[ny, nx]:
+                            visited[ny, nx] = True
+                            queue.append((ny, nx))
+                components.append(np.array(pixels, dtype=np.int32))
+        return components
+
+
 def component_centers(mask: np.ndarray) -> list[tuple[int, int]]:
-    cv2 = require_cv2()
-    num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(mask.astype(np.uint8), connectivity=8)
+    """Extract per-component centers using floor() to match MATLAB centroid labels."""
     centers: list[tuple[int, int]] = []
-    for label in range(1, num_labels):
-        if stats[label, cv2.CC_STAT_AREA] <= 0:
+    for component in connected_components(mask):
+        if len(component) == 0:
             continue
-        cy = int(round(float(centroids[label][1])))
-        cx = int(round(float(centroids[label][0])))
+        ys = component[:, 0].astype(np.float32)
+        xs = component[:, 1].astype(np.float32)
+        cy = int(np.floor(float(ys.mean())))
+        cx = int(np.floor(float(xs.mean())))
         cy = min(max(cy, 0), mask.shape[0] - 1)
         cx = min(max(cx, 0), mask.shape[1] - 1)
         centers.append((cy, cx))
@@ -100,6 +135,7 @@ def build_prior_from_response(
 
 # ============ Prior Generation Methods ============
 
+@lru_cache(maxsize=1)
 def require_cv2():
     try:
         import cv2  # type: ignore
@@ -194,6 +230,7 @@ __all__ = [
     "save_prior",
     # Prior building
     "SplitSummary",
+    "connected_components",
     "component_centers",
     "positive_pixel_centers",
     "make_anchor_mask",

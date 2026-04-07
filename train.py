@@ -4,18 +4,20 @@ import argparse
 import csv
 import json
 import random
+from dataclasses import replace
 from pathlib import Path
 
 import numpy as np
 import torch
-import torch.nn.functional
 from torch.amp import GradScaler, autocast
 from torch.utils.data import DataLoader
 
-from data import IRSTDPointDataset, worker_init_fn, build_dataset_config, validate_dataset_config
+from data import IRSTDPointDataset, worker_init_fn
+from dataset_config import build_dataset_config, validate_dataset_config
+from engine import evaluate_iou_only, evaluate_model, is_cuda_device
 from experiment_paths import build_run_output_dir, resolve_supervision_tag
 from metrics import BasicIRSTDMetrics
-from losses import build_criterion, resolve_method_name
+from losses import PointSupervisionLoss, TriZonePartialLoss, build_criterion, resolve_method_name
 from models import build_model as build_model_from_registry, get_default_channels, get_model_names, prepare_model_input
 
 
@@ -45,15 +47,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--train-split", type=str, default=None, help="Advanced override. Prefer --dataset-name.")
     parser.add_argument("--test-split", type=str, default=None, help="Advanced override. Prefer --dataset-name.")
     parser.add_argument("--point-label-dir", type=str, default=None, help="Advanced override. Prefer --dataset-name with --label-mode.")
-    parser.add_argument(
-        "--use-loaded-point-labels",
-        action="store_true",
-        help="Use weak point/coarse labels from --point-label-dir directly instead of generating point maps from full masks.",
-    )
     parser.add_argument("--inner-prior-dir", type=str, default=None)
     parser.add_argument("--outer-prior-dir", type=str, default=None)
     parser.add_argument("--crop-size", type=int, default=256)
-    parser.add_argument("--point-sigma", type=float, default=2.0)
     parser.add_argument("--focus-prob", type=float, default=0.7)
     parser.add_argument("--batch-size", type=int, default=16)
     parser.add_argument("--epochs", type=int, default=300)
@@ -83,7 +79,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--scheduler", type=str, choices=["none", "cosine"], default="cosine", help="LR scheduler.")
     parser.add_argument("--eta-min", type=float, default=1e-6, help="Minimum LR for cosine scheduler.")
     parser.add_argument("--eval-every", type=int, default=1, help="Run IoU validation every N epochs.")
+    parser.add_argument(
+        "--allow-nonfull-eval-mask",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Allow validation against a mask directory other than the dataset full masks.",
+    )
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
+    parser.add_argument(
+        "--deterministic",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Prefer deterministic CUDA behavior for reproducible experiments.",
+    )
     parser.add_argument(
         "--amp",
         action=argparse.BooleanOptionalAction,
@@ -91,11 +99,6 @@ def parse_args() -> argparse.Namespace:
         help="Enable automatic mixed precision on CUDA",
     )
     return parser.parse_args()
-
-
-def is_cuda_device(device: torch.device | str) -> bool:
-    return torch.device(device).type == "cuda"
-
 
 def should_run(epoch: int, interval: int) -> bool:
     return interval > 0 and epoch % interval == 0
@@ -114,19 +117,12 @@ def make_loader(
     dataset_config,
     split_name: str,
     train: bool,
-    supervision_masks: dict[str, np.ndarray] | None = None,
-    include_names: set[str] | None = None,
-    include_point_labels: bool = False,
 ) -> DataLoader:
     image_dir_name = dataset_config.train_image_dir if train else dataset_config.test_image_dir
     mask_dir_name = dataset_config.train_mask_dir if train else dataset_config.test_mask_dir
 
-    # For weak supervision (centroid/coarse), use pre-generated weak labels (masks_centroid/masks_coarse)
-    # This ensures: 1) Consistency across methods, 2) Proper use of coarse labels with offsets
-    use_weak_labels = args.label_mode in {"centroid", "coarse"} and (train or include_point_labels)
-
     point_label_dir = None
-    if use_weak_labels:
+    if train and args.label_mode in {"centroid", "coarse"}:
         point_label_dir = dataset_config.point_label_dir_for(args.label_mode) or args.point_label_dir
 
     dataset = IRSTDPointDataset(
@@ -138,126 +134,25 @@ def make_loader(
         inner_prior_dir=args.inner_prior_dir if train else None,
         outer_prior_dir=args.outer_prior_dir if train else None,
         crop_size=args.crop_size,
-        point_sigma=args.point_sigma,
-        use_loaded_point_labels=use_weak_labels,
         train=train,
         focus_prob=args.focus_prob,
         seed=args.seed,
         cache_data=args.cache_data,
-        supervision_masks=supervision_masks,
-        include_names=include_names,
         img_mean=dataset_config.img_mean,
         img_std=dataset_config.img_std,
     )
+    generator = torch.Generator()
+    generator.manual_seed(args.seed if train else args.seed + 1)
     return DataLoader(
         dataset,
         batch_size=args.batch_size if train else 1,
         shuffle=train,
         num_workers=args.num_workers,
+        generator=generator,
         pin_memory=is_cuda_device(args.device),
         persistent_workers=(args.num_workers > 0),
         worker_init_fn=worker_init_fn if args.num_workers > 0 else None,
     )
-
-
-@torch.no_grad()
-def evaluate(
-    model: torch.nn.Module,
-    loader: DataLoader,
-    device: torch.device,
-    thresholds: list[float],
-    use_amp: bool,
-    model_name: str,
-    compute_object_metrics: bool = True,
-) -> dict[str, float]:
-    model.eval()
-    metrics = BasicIRSTDMetrics(thresholds=thresholds)
-    for batch_idx, batch in enumerate(loader):
-        raw_image = batch["image"].to(device, non_blocking=True)
-        orig_h, orig_w = raw_image.shape[-2], raw_image.shape[-1]
-        image = prepare_model_input(raw_image, model_name)
-        with autocast(device_type=device.type, enabled=use_amp):
-            logits = model(image)
-        prob = torch.sigmoid(logits)
-
-        # Ensure output matches original input size
-        if prob.shape[-2:] != (orig_h, orig_w):
-            prob = torch.nn.functional.interpolate(
-                prob, size=(orig_h, orig_w), mode='bilinear', align_corners=False
-            )
-
-        # Get ground truth and ensure it matches prediction size
-        mask_tensor = batch["mask"].to(device, non_blocking=True)
-        if mask_tensor.shape[-2:] != (orig_h, orig_w):
-            mask_tensor = torch.nn.functional.interpolate(
-                mask_tensor, size=(orig_h, orig_w), mode='nearest'
-            )
-
-        # Safety check for valid predictions
-        if torch.isnan(prob).any() or torch.isinf(prob).any():
-            print(f"Warning: Invalid predictions in batch {batch_idx}, skipping...")
-            continue
-
-        metrics.update_pixel(prob, mask_tensor)
-        if compute_object_metrics:
-            metrics.update_pd_fa(prob[0, 0].cpu().numpy(), mask_tensor[0, 0].cpu().numpy())
-    return metrics.get_results(include_object_metrics=compute_object_metrics)
-
-
-@torch.no_grad()
-def evaluate_iou_only(
-    model: torch.nn.Module,
-    loader: DataLoader,
-    device: torch.device,
-    threshold: float,
-    use_amp: bool,
-    model_name: str,
-) -> float:
-    model.eval()
-    total_inter = 0.0
-    total_union = 0.0
-    for batch_idx, batch in enumerate(loader):
-        raw_image = batch["image"].to(device, non_blocking=True)
-        orig_h, orig_w = raw_image.shape[-2], raw_image.shape[-1]
-        image = prepare_model_input(raw_image, model_name)
-        with autocast(device_type=device.type, enabled=use_amp):
-            logits = model(image)
-        prob = torch.sigmoid(logits)
-
-        # Ensure output matches original input size
-        if prob.shape[-2:] != (orig_h, orig_w):
-            prob = torch.nn.functional.interpolate(
-                prob, size=(orig_h, orig_w), mode='bilinear', align_corners=False
-            )
-
-        # Get ground truth and ensure it matches prediction size
-        gt_mask = batch["mask"].to(device, non_blocking=True)
-        if gt_mask.shape[-2:] != (orig_h, orig_w):
-            gt_mask = torch.nn.functional.interpolate(
-                gt_mask, size=(orig_h, orig_w), mode='nearest'
-            )
-
-        pred_bin = prob > threshold
-        gt_bin = gt_mask > 0
-
-        # Safety checks
-        batch_inter = float((pred_bin & gt_bin).sum().item())
-        batch_union = float((pred_bin | gt_bin).sum().item())
-
-        # Skip invalid batches
-        if batch_union == 0 or batch_inter > batch_union or not torch.isfinite(torch.tensor(batch_inter)):
-            continue
-
-        total_inter += batch_inter
-        total_union += batch_union
-
-    # Ensure valid IoU calculation
-    if total_union == 0 or not torch.isfinite(torch.tensor(total_inter)) or not torch.isfinite(torch.tensor(total_union)):
-        return 0.0
-
-    iou = (total_inter / total_union * 100.0)
-    return min(iou, 100.0)  # Cap at 100%
-
 
 def train_one_epoch(
     model: torch.nn.Module,
@@ -285,7 +180,7 @@ def train_one_epoch(
         optimizer.zero_grad(set_to_none=True)
         with autocast(device_type=device.type, enabled=use_amp):
             logits = model(image)
-            if hasattr(criterion, "point_loss"):
+            if isinstance(criterion, TriZonePartialLoss):
                 point = batch["point"].to(device, non_blocking=True)
                 inner_prior = batch["inner_prior"].to(device, non_blocking=True)
                 outer_prior = batch["outer_prior"].to(device, non_blocking=True)
@@ -299,6 +194,14 @@ def train_one_epoch(
                     enable_inner=use_prior_terms,
                     enable_outer=use_prior_terms,
                 )
+            elif isinstance(criterion, PointSupervisionLoss):
+                point = batch["point"].to(device, non_blocking=True)
+                loss = criterion(logits, point)
+                stats = {
+                    "loss": float(loss.detach().item()),
+                    "inner_loss": 0.0,
+                    "outer_loss": 0.0,
+                }
             else:
                 mask = batch["mask"].to(device, non_blocking=True)
                 loss = criterion(logits, mask)
@@ -362,30 +265,111 @@ def save_json(path: Path, payload: dict) -> None:
     path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
 
 
-def main() -> None:
-    args = parse_args()
-    dataset_config = build_dataset_config(args)
-    set_seed(args.seed)
-    method_name = resolve_method_name(args)
-    validate_dataset_config(dataset_config, require_train_split=True)
+def resolve_dataset_relative_path(path_like: str | Path, dataset_root: Path) -> Path:
+    path_obj = Path(path_like)
+    if path_obj.is_absolute():
+        return path_obj.resolve()
+    cwd_candidate = path_obj.resolve()
+    if cwd_candidate.exists():
+        return cwd_candidate
+    return (dataset_root / path_obj).resolve()
+
+
+def resolve_point_label_dir(args: argparse.Namespace, dataset_config) -> str | None:
+    if args.label_mode in {"centroid", "coarse"}:
+        return dataset_config.point_label_dir_for(args.label_mode) or args.point_label_dir
+    return None
+
+
+def resolve_eval_mask_dir(args: argparse.Namespace, dataset_config) -> str:
+    eval_mask_dir = args.test_mask_dir_name or dataset_config.test_mask_dir
+    if not args.allow_nonfull_eval_mask and eval_mask_dir != dataset_config.test_mask_dir:
+        raise ValueError(
+            f"Evaluation must use the dataset full masks ('{dataset_config.test_mask_dir}'). "
+            f"Got '{eval_mask_dir}'. Use --allow-nonfull-eval-mask only for non-paper debugging."
+        )
+    return eval_mask_dir
+
+
+def load_prior_manifest(prior_dir: str, expected_key: str) -> dict:
+    prior_path = Path(prior_dir).resolve()
+    if not prior_path.exists():
+        raise FileNotFoundError(f"Prior directory does not exist: {prior_path}")
+    try:
+        manifest_path = prior_path.parents[1] / "manifest.json"
+    except IndexError as exc:
+        raise ValueError(f"Prior directory has unexpected layout: {prior_path}") from exc
+    if not manifest_path.exists():
+        raise FileNotFoundError(
+            f"Missing prior manifest for {expected_key}: expected {manifest_path}"
+        )
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    resolved_prior_dir = Path(manifest.get(expected_key, "")).resolve()
+    if resolved_prior_dir != prior_path:
+        raise ValueError(
+            f"Prior manifest mismatch for {expected_key}: expected {prior_path}, manifest recorded {resolved_prior_dir}"
+        )
+    return manifest
+
+
+def validate_safe_priors(
+    args: argparse.Namespace,
+    dataset_config,
+    point_label_dir: str,
+) -> None:
+    manifests: list[dict] = []
+    if args.inner_loss_weight > 0:
+        manifests.append(load_prior_manifest(args.inner_prior_dir, "inner_prior_dir"))
+    if args.outer_loss_weight > 0:
+        manifests.append(load_prior_manifest(args.outer_prior_dir, "outer_prior_dir"))
+    if not manifests:
+        return
+
+    first_manifest = manifests[0]
+    for manifest in manifests:
+        if manifest.get("dataset_name") != dataset_config.name:
+            raise ValueError(
+                f"SAFE prior dataset mismatch: expected '{dataset_config.name}', got '{manifest.get('dataset_name')}'."
+            )
+        if manifest.get("label_mode") != args.label_mode:
+            raise ValueError(
+                f"SAFE prior label-mode mismatch: expected '{args.label_mode}', got '{manifest.get('label_mode')}'."
+            )
+        manifest_anchor_dir = manifest.get("anchor_label_dir")
+        if manifest_anchor_dir is None:
+            raise ValueError("SAFE prior manifest is missing 'anchor_label_dir'. Regenerate priors with the current script.")
+        expected_anchor_dir = resolve_dataset_relative_path(point_label_dir, dataset_config.root)
+        if Path(manifest_anchor_dir).resolve() != expected_anchor_dir:
+            raise ValueError(
+                f"SAFE prior anchor mismatch: expected anchor dir '{expected_anchor_dir}', got '{manifest_anchor_dir}'."
+            )
+        if manifest.get("output_root") != first_manifest.get("output_root"):
+            raise ValueError("Inner and outer SAFE priors must come from the same prior-generation run.")
+
+
+def validate_training_args(args: argparse.Namespace, dataset_config, point_label_dir: str | None) -> None:
     if args.inner_loss_weight > 0 and args.inner_prior_dir is None:
         raise ValueError("--inner-prior-dir is required when --inner-loss-weight > 0.")
     if args.outer_loss_weight > 0 and args.outer_prior_dir is None:
         raise ValueError("--outer-prior-dir is required when --outer-loss-weight > 0.")
     if args.label_mode is None:
         raise ValueError("--label-mode is required. Choose from: full, centroid, coarse.")
-    point_label_dir = dataset_config.point_label_dir_for(args.label_mode) or args.point_label_dir
-    if args.use_loaded_point_labels and point_label_dir is None:
-        raise ValueError("Point supervision with loaded weak labels requires a point-label directory or dataset label mode.")
+    if args.label_mode in {"centroid", "coarse"} and point_label_dir is None:
+        raise ValueError(
+            f"--label-mode={args.label_mode} requires pre-generated weak labels "
+            "(dataset masks_centroid/masks_coarse or --point-label-dir)."
+        )
     if args.label_mode == "full":
         if args.method != "none":
             raise ValueError("--label-mode=full only supports --method=none (full supervision baseline).")
         if args.inner_loss_weight > 0 or args.outer_loss_weight > 0:
             raise ValueError("Tri-zone prior losses are not supported with full supervision.")
-        if args.use_loaded_point_labels:
-            raise ValueError("--use-loaded-point-labels is not supported with full supervision.")
     if args.method == "none" and (args.inner_loss_weight > 0 or args.outer_loss_weight > 0):
         raise ValueError("Tri-zone prior losses require --method=safe.")
+    if args.method == "safe" and args.inner_loss_weight <= 0 and args.outer_loss_weight <= 0:
+        raise ValueError(
+            "--method=safe requires --inner-loss-weight > 0 and/or --outer-loss-weight > 0."
+        )
     if (args.inner_decay_start_epoch is None) != (args.inner_decay_end_epoch is None):
         raise ValueError("--inner-decay-start-epoch and --inner-decay-end-epoch must be set together.")
     if args.inner_decay_start_epoch is not None and args.inner_decay_end_epoch <= args.inner_decay_start_epoch:
@@ -398,6 +382,31 @@ def main() -> None:
         raise ValueError("--outer-boost-scale must be >= 1.0.")
     if args.eval_every <= 0:
         raise ValueError("--eval-every must be >= 1.")
+    resolve_eval_mask_dir(args, dataset_config)
+    if args.method == "safe":
+        assert point_label_dir is not None
+        validate_safe_priors(args, dataset_config, point_label_dir)
+
+
+def configure_runtime(device: torch.device, deterministic: bool) -> None:
+    if device.type != "cuda":
+        return
+    if not torch.cuda.is_available():
+        raise RuntimeError("CUDA was requested but is not available in this execution environment.")
+    torch.use_deterministic_algorithms(deterministic, warn_only=True)
+    torch.backends.cudnn.deterministic = deterministic
+    torch.backends.cudnn.benchmark = not deterministic
+
+
+def main() -> None:
+    args = parse_args()
+    dataset_config = build_dataset_config(args)
+    set_seed(args.seed)
+    method_name = resolve_method_name(args)
+    validate_dataset_config(dataset_config, require_train_split=True)
+    point_label_dir = resolve_point_label_dir(args, dataset_config)
+    validate_training_args(args, dataset_config, point_label_dir)
+    dataset_config = replace(dataset_config, test_mask_dir=resolve_eval_mask_dir(args, dataset_config))
     supervision_tag = resolve_supervision_tag(args.method, args.label_mode)
     output_dir = (
         Path(args.output_dir)
@@ -429,10 +438,7 @@ def main() -> None:
     save_json(output_dir / "config.json", config_payload)
 
     device = torch.device(args.device)
-    if device.type == "cuda":
-        if not torch.cuda.is_available():
-            raise RuntimeError("CUDA was requested but is not available in this execution environment.")
-        torch.backends.cudnn.benchmark = True
+    configure_runtime(device, args.deterministic)
     train_loader = make_loader(
         args,
         dataset_config,
@@ -544,7 +550,7 @@ def main() -> None:
 
     best_checkpoint = torch.load(best_checkpoint_path, map_location="cpu", weights_only=False)
     model.load_state_dict(best_checkpoint["model"])
-    final_metrics = evaluate(
+    final_metrics = evaluate_model(
         model,
         test_loader,
         device,

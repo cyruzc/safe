@@ -2,18 +2,17 @@ from __future__ import annotations
 
 import argparse
 import json
-from dataclasses import asdict, dataclass
+from dataclasses import asdict
 from pathlib import Path
 
 import numpy as np
 
-from data import build_dataset_config, validate_dataset_config
+from dataset_config import build_dataset_config, validate_dataset_config
 from experiment_paths import build_prior_output_root, build_prior_tag
 from utils import (
     METHOD_REGISTRY,
     SplitSummary,
     build_prior_from_response,
-    component_centers,
     load_grayscale,
     load_split_file,
     positive_pixel_centers,
@@ -35,12 +34,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--splits", type=str, nargs="+", default=None)
     parser.add_argument("--image-dir-name", type=str, default=None, help="Advanced override. Prefer --dataset-name.")
     parser.add_argument("--mask-dir-name", type=str, default=None, help="Advanced override. Prefer --dataset-name.")
+    parser.add_argument("--train-split", type=str, default=None, help="Advanced override. Prefer --dataset-name.")
+    parser.add_argument("--test-split", type=str, default=None, help="Advanced override. Prefer --dataset-name.")
     parser.add_argument(
         "--anchor-label-dir",
         type=str,
         default=None,
         help="Optional weak-label directory used to derive anchor points for prior construction. "
-        "If omitted, anchors are derived from --label-mode or from --mask-dir-name.",
+        "If omitted, anchors are derived from the dataset's weak-label directory for --label-mode.",
     )
     parser.add_argument("--inner-method", type=str, default="lagdm")
     parser.add_argument("--outer-method", type=str, default="wslcm")
@@ -52,8 +53,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--write-preview-png", action="store_true")
     return parser.parse_args()
 
+
+def validate_prior_args(args: argparse.Namespace) -> None:
+    if args.label_mode not in {"centroid", "coarse"}:
+        raise ValueError("--label-mode must be either 'centroid' or 'coarse' for SAFE prior generation.")
+
+
 def main() -> None:
     args = parse_args()
+    validate_prior_args(args)
     dataset_config = build_dataset_config(args)
     validate_dataset_config(dataset_config, require_train_split=False)
     dataset_root = dataset_config.root
@@ -69,8 +77,6 @@ def main() -> None:
     if args.output_root is not None:
         output_root = Path(args.output_root)
     else:
-        if args.label_mode is None:
-            raise ValueError("--label-mode is required when --output-root is not provided.")
         output_root = build_prior_output_root(
             args.experiments_root,
             dataset_config.name,
@@ -84,12 +90,13 @@ def main() -> None:
     image_dir_name = args.image_dir_name or dataset_config.train_image_dir
     mask_dir_name = args.mask_dir_name or dataset_config.train_mask_dir
     image_dir = dataset_root / image_dir_name
-    mask_dir = dataset_root / mask_dir_name
 
     resolved_anchor_label_dir = args.anchor_label_dir
-    if resolved_anchor_label_dir is None and args.label_mode is not None:
+    if resolved_anchor_label_dir is None:
         resolved_anchor_label_dir = dataset_config.point_label_dir_for(args.label_mode)
-    anchor_dir = dataset_root / resolved_anchor_label_dir if resolved_anchor_label_dir is not None else None
+    if resolved_anchor_label_dir is None:
+        raise ValueError("SAFE prior generation requires weak-label anchors. Provide --anchor-label-dir or a valid --label-mode.")
+    anchor_dir = dataset_root / resolved_anchor_label_dir
 
     splits = args.splits
     if not splits:
@@ -104,12 +111,8 @@ def main() -> None:
 
         for name in names:
             image = load_grayscale(image_dir / f"{name}.png")
-            mask = (load_grayscale(mask_dir / f"{name}.png") > 0).astype(np.uint8)
-            if anchor_dir is not None:
-                anchor_map = (load_grayscale(anchor_dir / f"{name}.png") > 0).astype(np.uint8)
-                centers = positive_pixel_centers(anchor_map)
-            else:
-                centers = component_centers(mask)
+            anchor_map = (load_grayscale(anchor_dir / f"{name}.png") > 0).astype(np.uint8)
+            centers = positive_pixel_centers(anchor_map)
 
             inner_response = inner_fn(image)
             outer_response = outer_fn(image)
@@ -151,12 +154,13 @@ def main() -> None:
 
     manifest = {
         "dataset_name": dataset_config.name,
+        "label_mode": args.label_mode,
         "dataset_root": str(dataset_root),
         "output_root": str(output_root),
         "resolved_prior_tag": resolved_prior_tag,
         "image_dir_name": image_dir_name,
         "mask_dir_name": mask_dir_name,
-        "anchor_label_dir": (str((dataset_root / resolved_anchor_label_dir).resolve()) if resolved_anchor_label_dir is not None else None),
+        "anchor_label_dir": str(anchor_dir.resolve()),
         "inner_method": args.inner_method,
         "outer_method": args.outer_method,
         "inner_prior_dir": str((output_root / "priors" / inner_tag).resolve()),
