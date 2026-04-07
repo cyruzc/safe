@@ -26,7 +26,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Generate offline response maps and binary priors for SAFE method"
     )
-    parser.add_argument("--dataset-name", type=str, choices=["sirst3", "irstd1k", "nuaa_sirst"], default=None)
+    parser.add_argument("--dataset-name", type=str, choices=["sirst3", "irstd1k", "nuaa_sirst", "nudt_sirst"], default=None)
     parser.add_argument("--label-mode", type=str, choices=["centroid", "coarse"], default=None)
     parser.add_argument("--dataset-root", type=str, default=None)
     parser.add_argument("--output-root", type=str, default=None, help="Optional explicit prior directory.")
