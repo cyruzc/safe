@@ -104,6 +104,16 @@ def make_anchor_mask(shape: tuple[int, int], centers: list[tuple[int, int]], rad
     return mask
 
 
+def dilate_binary_mask(mask: np.ndarray, radius: int) -> np.ndarray:
+    cv2 = require_cv2()
+    binary = (mask > 0).astype(np.uint8)
+    if radius <= 0:
+        return binary
+    kernel_size = radius * 2 + 1
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel_size, kernel_size))
+    return cv2.dilate(binary, kernel, iterations=1)
+
+
 def keep_connected_to_anchors(candidate: np.ndarray, anchor_mask: np.ndarray) -> np.ndarray:
     cv2 = require_cv2()
     num_labels, labels = cv2.connectedComponents(candidate.astype(np.uint8), connectivity=8)
@@ -234,6 +244,7 @@ __all__ = [
     "component_centers",
     "positive_pixel_centers",
     "make_anchor_mask",
+    "dilate_binary_mask",
     "keep_connected_to_anchors",
     "build_prior_from_response",
     # Prior generation methods
