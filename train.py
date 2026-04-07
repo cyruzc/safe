@@ -172,6 +172,8 @@ def train_one_epoch(
         "main_loss": 0.0,
         "inner_loss": 0.0,
         "outer_loss": 0.0,
+        "inner_mean": 0.0,
+        "outer_mean": 0.0,
         "inner_weighted": 0.0,
         "outer_weighted": 0.0,
     }
@@ -205,6 +207,8 @@ def train_one_epoch(
                     "main_loss": float(loss.detach().item()),
                     "inner_loss": 0.0,
                     "outer_loss": 0.0,
+                    "inner_mean": 0.0,
+                    "outer_mean": 0.0,
                     "inner_weighted": 0.0,
                     "outer_weighted": 0.0,
                 }
@@ -216,6 +220,8 @@ def train_one_epoch(
                     "main_loss": float(loss.detach().item()),
                     "inner_loss": 0.0,
                     "outer_loss": 0.0,
+                    "inner_mean": 0.0,
+                    "outer_mean": 0.0,
                     "inner_weighted": 0.0,
                     "outer_weighted": 0.0,
                 }
@@ -230,6 +236,8 @@ def train_one_epoch(
         totals["main_loss"] += stats["main_loss"]
         totals["inner_loss"] += stats["inner_loss"]
         totals["outer_loss"] += stats["outer_loss"]
+        totals["inner_mean"] += stats["inner_mean"]
+        totals["outer_mean"] += stats["outer_mean"]
         totals["inner_weighted"] += stats["inner_weighted"]
         totals["outer_weighted"] += stats["outer_weighted"]
 
@@ -324,38 +332,67 @@ def load_prior_manifest(prior_dir: str, expected_key: str) -> dict:
     return manifest
 
 
+def infer_prior_context(prior_dir: str) -> dict[str, Path | str]:
+    prior_path = Path(prior_dir).resolve()
+    try:
+        output_root = prior_path.parents[1].resolve()
+        label_mode = prior_path.parents[2].name
+        dataset_name = prior_path.parents[3].name
+    except IndexError as exc:
+        raise ValueError(f"Prior directory has unexpected layout: {prior_path}") from exc
+    return {
+        "output_root": output_root,
+        "label_mode": label_mode,
+        "dataset_name": dataset_name,
+    }
+
+
 def validate_safe_priors(
     args: argparse.Namespace,
     dataset_config,
     point_label_dir: str,
 ) -> None:
-    manifests: list[dict] = []
+    manifests: list[tuple[dict, str]] = []
     if args.inner_loss_weight > 0:
-        manifests.append(load_prior_manifest(args.inner_prior_dir, "inner_prior_dir"))
+        manifests.append((load_prior_manifest(args.inner_prior_dir, "inner_prior_dir"), args.inner_prior_dir))
     if args.outer_loss_weight > 0:
-        manifests.append(load_prior_manifest(args.outer_prior_dir, "outer_prior_dir"))
+        manifests.append((load_prior_manifest(args.outer_prior_dir, "outer_prior_dir"), args.outer_prior_dir))
     if not manifests:
         return
 
-    first_manifest = manifests[0]
-    for manifest in manifests:
-        if manifest.get("dataset_name") != dataset_config.name:
+    expected_anchor_dir = resolve_dataset_relative_path(point_label_dir, dataset_config.root)
+    first_output_root: Path | None = None
+    for manifest, prior_dir in manifests:
+        inferred = infer_prior_context(prior_dir)
+        manifest_dataset_name = manifest.get("dataset_name") or inferred["dataset_name"]
+        if manifest_dataset_name != dataset_config.name:
             raise ValueError(
-                f"SAFE prior dataset mismatch: expected '{dataset_config.name}', got '{manifest.get('dataset_name')}'."
+                f"SAFE prior dataset mismatch: expected '{dataset_config.name}', got '{manifest_dataset_name}'."
             )
-        if manifest.get("label_mode") != args.label_mode:
+        manifest_label_mode = manifest.get("label_mode") or inferred["label_mode"]
+        if manifest_label_mode != args.label_mode:
             raise ValueError(
-                f"SAFE prior label-mode mismatch: expected '{args.label_mode}', got '{manifest.get('label_mode')}'."
+                f"SAFE prior label-mode mismatch: expected '{args.label_mode}', got '{manifest_label_mode}'."
             )
         manifest_anchor_dir = manifest.get("anchor_label_dir")
-        if manifest_anchor_dir is None:
-            raise ValueError("SAFE prior manifest is missing 'anchor_label_dir'. Regenerate priors with the current script.")
-        expected_anchor_dir = resolve_dataset_relative_path(point_label_dir, dataset_config.root)
-        if Path(manifest_anchor_dir).resolve() != expected_anchor_dir:
+        resolved_anchor_dir = (
+            expected_anchor_dir
+            if manifest_anchor_dir is None
+            else resolve_dataset_relative_path(manifest_anchor_dir, dataset_config.root)
+        )
+        if resolved_anchor_dir != expected_anchor_dir:
             raise ValueError(
-                f"SAFE prior anchor mismatch: expected anchor dir '{expected_anchor_dir}', got '{manifest_anchor_dir}'."
+                f"SAFE prior anchor mismatch: expected anchor dir '{expected_anchor_dir}', got '{resolved_anchor_dir}'."
             )
-        if manifest.get("output_root") != first_manifest.get("output_root"):
+        output_root_raw = manifest.get("output_root")
+        resolved_output_root = (
+            inferred["output_root"]
+            if output_root_raw is None
+            else Path(output_root_raw).resolve()
+        )
+        if first_output_root is None:
+            first_output_root = resolved_output_root
+        if resolved_output_root != first_output_root:
             raise ValueError("Inner and outer SAFE priors must come from the same prior-generation run.")
 
 
@@ -485,6 +522,8 @@ def main() -> None:
                 "main_loss",
                 "inner_loss",
                 "outer_loss",
+                "inner_mean",
+                "outer_mean",
                 "inner_weighted",
                 "outer_weighted",
                 primary_iou_key,
@@ -520,6 +559,8 @@ def main() -> None:
             row["main_loss"] = f"{train_stats['main_loss']:.4f}"
             row["inner_loss"] = f"{train_stats['inner_loss']:.4f}"
             row["outer_loss"] = f"{train_stats['outer_loss']:.4f}"
+            row["inner_mean"] = f"{train_stats['inner_mean']:.4f}"
+            row["outer_mean"] = f"{train_stats['outer_mean']:.4f}"
             row["inner_weighted"] = f"{train_stats['inner_weighted']:.4f}"
             row["outer_weighted"] = f"{train_stats['outer_weighted']:.4f}"
 
@@ -559,9 +600,9 @@ def main() -> None:
                 f"epoch={epoch:03d} "
                 f"loss={train_stats['loss']:.4f} "
                 f"main={train_stats['main_loss']:.4f} "
-                f"inner_raw={train_stats['inner_loss']:.4f} "
+                f"inner={train_stats['inner_loss']:.4f} "
                 f"inner_w={train_stats['inner_weighted']:.4f} "
-                f"outer_raw={train_stats['outer_loss']:.4f} "
+                f"outer={train_stats['outer_loss']:.4f} "
                 f"outer_w={train_stats['outer_weighted']:.4f}"
             )
             if ran_eval:

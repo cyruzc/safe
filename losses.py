@@ -116,6 +116,15 @@ class TriZonePartialLoss(nn.Module):
     def _masked_mean(self, value: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
         return (value * mask).sum() / mask.sum().clamp_min(self.eps)
 
+    def _point_normalized_masked_sum(
+        self,
+        value: torch.Tensor,
+        mask: torch.Tensor,
+        point_targets: torch.Tensor,
+    ) -> torch.Tensor:
+        point_count = point_targets.ge(0.5).sum().clamp_min(1)
+        return (value * mask).sum() / point_count
+
     def forward(
         self,
         logits: torch.Tensor,
@@ -133,14 +142,20 @@ class TriZonePartialLoss(nn.Module):
         effective_outer_weight = self.outer_weight * outer_weight_scale
 
         inner_term = logits.new_zeros(())
+        inner_mean = logits.new_zeros(())
         if effective_inner_weight > 0 and enable_inner:
             inner_mask = (inner_prior > 0.5).float()
-            inner_term = self._masked_mean((1.0 - prob) ** 2, inner_mask)
+            inner_value = (1.0 - prob) ** 2
+            inner_mean = self._masked_mean(inner_value, inner_mask)
+            inner_term = self._point_normalized_masked_sum(inner_value, inner_mask, point_targets)
 
         outer_term = logits.new_zeros(())
+        outer_mean = logits.new_zeros(())
         if effective_outer_weight > 0 and enable_outer:
             outer_forbidden = (outer_prior <= 0.5).float()
-            outer_term = self._masked_mean(prob ** 2, outer_forbidden)
+            outer_value = prob ** 2
+            outer_mean = self._masked_mean(outer_value, outer_forbidden)
+            outer_term = self._point_normalized_masked_sum(outer_value, outer_forbidden, point_targets)
 
         inner_weighted = effective_inner_weight * inner_term
         outer_weighted = effective_outer_weight * outer_term
@@ -150,6 +165,8 @@ class TriZonePartialLoss(nn.Module):
             "main_loss": float(point_term.detach().item()),
             "inner_loss": float(inner_term.detach().item()),
             "outer_loss": float(outer_term.detach().item()),
+            "inner_mean": float(inner_mean.detach().item()),
+            "outer_mean": float(outer_mean.detach().item()),
             "inner_weighted": float(inner_weighted.detach().item()),
             "outer_weighted": float(outer_weighted.detach().item()),
             "effective_inner_weight": float(effective_inner_weight),
