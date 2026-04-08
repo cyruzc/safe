@@ -119,6 +119,11 @@ class TriZonePartialLoss(nn.Module):
         point_loss: PointSupervisionLoss,
         inner_weight: float = 0.0,
         outer_weight: float = 0.0,
+        hn_weight: float = 0.0,
+        tv_weight: float = 0.0,
+        tau_in: float = 0.6,
+        tau_out: float = 0.1,
+        hard_negative_topk: int = 64,
         eps: float = 1e-6,
         inner_decay_schedule: tuple[int, int] | None = None,
         outer_boost_schedule: tuple[int, int, float] | None = None,
@@ -127,6 +132,11 @@ class TriZonePartialLoss(nn.Module):
         self.point_loss = point_loss
         self.inner_weight = inner_weight
         self.outer_weight = outer_weight
+        self.hn_weight = hn_weight
+        self.tv_weight = tv_weight
+        self.tau_in = tau_in
+        self.tau_out = tau_out
+        self.hard_negative_topk = hard_negative_topk
         self.eps = eps
         self.inner_decay_schedule = inner_decay_schedule
         self.outer_boost_schedule = outer_boost_schedule
@@ -134,14 +144,23 @@ class TriZonePartialLoss(nn.Module):
     def _masked_mean(self, value: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
         return (value * mask).sum() / mask.sum().clamp_min(self.eps)
 
-    def _point_normalized_masked_sum(
-        self,
-        value: torch.Tensor,
-        mask: torch.Tensor,
-        point_targets: torch.Tensor,
-    ) -> torch.Tensor:
-        point_count = point_targets.ge(0.5).sum().clamp_min(1)
-        return (value * mask).sum() / point_count
+    def _anchor_loss(self, prob: torch.Tensor, point_targets: torch.Tensor) -> torch.Tensor:
+        anchor = (point_targets >= self.point_loss.positive_threshold).float()
+        return -((anchor * torch.log(prob.clamp_min(self.eps))).sum() / anchor.sum().clamp_min(self.eps))
+
+    def _tv_loss(self, prob: torch.Tensor) -> torch.Tensor:
+        dx = torch.abs(prob[:, :, :, 1:] - prob[:, :, :, :-1]).mean()
+        dy = torch.abs(prob[:, :, 1:, :] - prob[:, :, :-1, :]).mean()
+        return dx + dy
+
+    def _hard_negative_loss(self, prob: torch.Tensor, forbidden_mask: torch.Tensor) -> torch.Tensor:
+        # forbidden_mask: 1 indicates invalid / negative region to suppress
+        forbidden_values = prob[forbidden_mask > 0.5]
+        if forbidden_values.numel() == 0:
+            return prob.new_zeros(())
+        topk = min(self.hard_negative_topk, forbidden_values.numel())
+        top_values = torch.topk(forbidden_values, k=topk, largest=True).values
+        return F.relu(top_values - self.tau_out).mean()
 
     def forward(
         self,
@@ -151,44 +170,59 @@ class TriZonePartialLoss(nn.Module):
         outer_prior: torch.Tensor,
         inner_weight_scale: float = 1.0,
         outer_weight_scale: float = 1.0,
+        hn_weight_scale: float = 1.0,
         enable_inner: bool = True,
         enable_outer: bool = True,
+        enable_hn: bool = True,
+        enable_tv: bool = True,
     ) -> tuple[torch.Tensor, dict[str, float]]:
-        point_term = self.point_loss(logits, point_targets)
         prob = torch.sigmoid(logits)
+        point_term = self._anchor_loss(prob, point_targets)
         effective_inner_weight = self.inner_weight * inner_weight_scale
         effective_outer_weight = self.outer_weight * outer_weight_scale
+        effective_hn_weight = self.hn_weight * hn_weight_scale
 
         inner_term = logits.new_zeros(())
-        inner_mean = logits.new_zeros(())
         if effective_inner_weight > 0 and enable_inner:
             inner_mask = (inner_prior > 0.5).float()
-            inner_value = (1.0 - prob) ** 2
-            inner_mean = self._masked_mean(inner_value, inner_mask)
-            inner_term = self._point_normalized_masked_sum(inner_value, inner_mask, point_targets)
+            inner_value = F.relu(self.tau_in - prob).pow(2)
+            inner_term = self._masked_mean(inner_value, inner_mask)
 
         outer_term = logits.new_zeros(())
-        outer_mean = logits.new_zeros(())
+        outer_forbidden = (outer_prior <= 0.5).float()
         if effective_outer_weight > 0 and enable_outer:
-            outer_forbidden = (outer_prior <= 0.5).float()
-            outer_value = prob ** 2
-            outer_mean = self._masked_mean(outer_value, outer_forbidden)
-            outer_term = outer_mean
+            outer_value = F.relu(prob - self.tau_out).pow(2)
+            outer_term = self._masked_mean(outer_value, outer_forbidden)
+
+        hn_term = logits.new_zeros(())
+        if effective_hn_weight > 0 and enable_hn:
+            hn_term = self._hard_negative_loss(prob, outer_forbidden)
+
+        tv_term = logits.new_zeros(())
+        if self.tv_weight > 0 and enable_tv:
+            tv_term = self._tv_loss(prob)
 
         inner_weighted = effective_inner_weight * inner_term
         outer_weighted = effective_outer_weight * outer_term
-        total = point_term + inner_weighted + outer_weighted
+        hn_weighted = effective_hn_weight * hn_term
+        tv_weighted = self.tv_weight * tv_term
+        total = point_term + inner_weighted + outer_weighted + hn_weighted + tv_weighted
         stats = {
             "loss": float(total.detach().item()),
             "main_loss": float(point_term.detach().item()),
             "inner_loss": float(inner_term.detach().item()),
             "outer_loss": float(outer_term.detach().item()),
-            "inner_mean": float(inner_mean.detach().item()),
-            "outer_mean": float(outer_mean.detach().item()),
+            "hn_loss": float(hn_term.detach().item()),
+            "tv_loss": float(tv_term.detach().item()),
+            "inner_mean": float(inner_term.detach().item()),
+            "outer_mean": float(outer_term.detach().item()),
             "inner_weighted": float(inner_weighted.detach().item()),
             "outer_weighted": float(outer_weighted.detach().item()),
+            "hn_weighted": float(hn_weighted.detach().item()),
+            "tv_weighted": float(tv_weighted.detach().item()),
             "effective_inner_weight": float(effective_inner_weight),
             "effective_outer_weight": float(effective_outer_weight),
+            "effective_hn_weight": float(effective_hn_weight),
         }
         return total, stats
 
@@ -258,6 +292,11 @@ def build_criterion(args: argparse.Namespace, method_name: str) -> MethodBundle:
             point_loss=build_point_supervision_loss(args, loss_type),
             inner_weight=args.inner_loss_weight,
             outer_weight=args.outer_loss_weight,
+            hn_weight=args.hn_loss_weight,
+            tv_weight=args.tv_loss_weight,
+            tau_in=args.tau_in,
+            tau_out=args.tau_out,
+            hard_negative_topk=args.hard_negative_topk,
             inner_decay_schedule=(
                 (args.inner_decay_start_epoch, args.inner_decay_end_epoch)
                 if args.inner_decay_start_epoch is not None else None

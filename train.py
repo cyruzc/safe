@@ -70,6 +70,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--loss-type", type=str, choices=["bce", "focal"], default="focal", help="Loss function type: bce (weighted BCE) or focal (LESPS-style)")
     parser.add_argument("--inner-loss-weight", type=float, default=0.0)
     parser.add_argument("--outer-loss-weight", type=float, default=0.0)
+    parser.add_argument("--hn-loss-weight", type=float, default=0.0)
+    parser.add_argument("--tv-loss-weight", type=float, default=0.0)
+    parser.add_argument("--tau-in", type=float, default=0.6)
+    parser.add_argument("--tau-out", type=float, default=0.1)
+    parser.add_argument("--hard-negative-topk", type=int, default=64)
     parser.add_argument("--prior-warmup-epochs", type=int, default=0)
     parser.add_argument("--inner-decay-start-epoch", type=int, default=None)
     parser.add_argument("--inner-decay-end-epoch", type=int, default=None)
@@ -174,8 +179,12 @@ def train_one_epoch(
         "outer_loss": 0.0,
         "inner_mean": 0.0,
         "outer_mean": 0.0,
+        "hn_loss": 0.0,
+        "tv_loss": 0.0,
         "inner_weighted": 0.0,
         "outer_weighted": 0.0,
+        "hn_weighted": 0.0,
+        "tv_weighted": 0.0,
     }
     use_prior_terms = epoch > prior_warmup_epochs
     inner_weight_scale = get_inner_weight_scale(criterion, epoch, prior_warmup_epochs)
@@ -196,8 +205,11 @@ def train_one_epoch(
                     outer_prior,
                     inner_weight_scale=inner_weight_scale,
                     outer_weight_scale=outer_weight_scale,
+                    hn_weight_scale=outer_weight_scale,
                     enable_inner=use_prior_terms,
                     enable_outer=use_prior_terms,
+                    enable_hn=use_prior_terms,
+                    enable_tv=True,
                 )
             elif isinstance(criterion, PointSupervisionLoss):
                 point = batch["point"].to(device, non_blocking=True)
@@ -209,8 +221,12 @@ def train_one_epoch(
                     "outer_loss": 0.0,
                     "inner_mean": 0.0,
                     "outer_mean": 0.0,
+                    "hn_loss": 0.0,
+                    "tv_loss": 0.0,
                     "inner_weighted": 0.0,
                     "outer_weighted": 0.0,
+                    "hn_weighted": 0.0,
+                    "tv_weighted": 0.0,
                 }
             else:
                 mask = batch["mask"].to(device, non_blocking=True)
@@ -222,8 +238,12 @@ def train_one_epoch(
                     "outer_loss": 0.0,
                     "inner_mean": 0.0,
                     "outer_mean": 0.0,
+                    "hn_loss": 0.0,
+                    "tv_loss": 0.0,
                     "inner_weighted": 0.0,
                     "outer_weighted": 0.0,
+                    "hn_weighted": 0.0,
+                    "tv_weighted": 0.0,
                 }
         scaler.scale(loss).backward()
         scaler.unscale_(optimizer)
@@ -238,8 +258,12 @@ def train_one_epoch(
         totals["outer_loss"] += stats["outer_loss"]
         totals["inner_mean"] += stats["inner_mean"]
         totals["outer_mean"] += stats["outer_mean"]
+        totals["hn_loss"] += stats["hn_loss"]
+        totals["tv_loss"] += stats["tv_loss"]
         totals["inner_weighted"] += stats["inner_weighted"]
         totals["outer_weighted"] += stats["outer_weighted"]
+        totals["hn_weighted"] += stats["hn_weighted"]
+        totals["tv_weighted"] += stats["tv_weighted"]
 
     denom = max(len(loader), 1)
     return {key: value / denom for key, value in totals.items()}
@@ -399,8 +423,8 @@ def validate_safe_priors(
 def validate_training_args(args: argparse.Namespace, dataset_config, point_label_dir: str | None) -> None:
     if args.inner_loss_weight > 0 and args.inner_prior_dir is None:
         raise ValueError("--inner-prior-dir is required when --inner-loss-weight > 0.")
-    if args.outer_loss_weight > 0 and args.outer_prior_dir is None:
-        raise ValueError("--outer-prior-dir is required when --outer-loss-weight > 0.")
+    if (args.outer_loss_weight > 0 or args.hn_loss_weight > 0) and args.outer_prior_dir is None:
+        raise ValueError("--outer-prior-dir is required when --outer-loss-weight > 0 or --hn-loss-weight > 0.")
     if args.label_mode is None:
         raise ValueError("--label-mode is required. Choose from: full, centroid, coarse.")
     if args.label_mode in {"centroid", "coarse"} and point_label_dir is None:
@@ -411,14 +435,21 @@ def validate_training_args(args: argparse.Namespace, dataset_config, point_label
     if args.label_mode == "full":
         if args.method != "none":
             raise ValueError("--label-mode=full only supports --method=none (full supervision baseline).")
-        if args.inner_loss_weight > 0 or args.outer_loss_weight > 0:
+        if args.inner_loss_weight > 0 or args.outer_loss_weight > 0 or args.hn_loss_weight > 0 or args.tv_loss_weight > 0:
             raise ValueError("Tri-zone prior losses are not supported with full supervision.")
-    if args.method == "none" and (args.inner_loss_weight > 0 or args.outer_loss_weight > 0):
+    if args.method == "none" and (args.inner_loss_weight > 0 or args.outer_loss_weight > 0 or args.hn_loss_weight > 0 or args.tv_loss_weight > 0):
         raise ValueError("Tri-zone prior losses require --method=safe.")
-    if args.method == "safe" and args.inner_loss_weight <= 0 and args.outer_loss_weight <= 0:
+    if args.method == "safe" and args.inner_loss_weight <= 0 and args.outer_loss_weight <= 0 and args.hn_loss_weight <= 0 and args.tv_loss_weight <= 0:
         raise ValueError(
-            "--method=safe requires --inner-loss-weight > 0 and/or --outer-loss-weight > 0."
+            "--method=safe requires at least one positive loss weight among "
+            "--inner-loss-weight/--outer-loss-weight/--hn-loss-weight/--tv-loss-weight."
         )
+    if not (0.0 <= args.tau_in <= 1.0):
+        raise ValueError("--tau-in must be in [0, 1].")
+    if not (0.0 <= args.tau_out <= 1.0):
+        raise ValueError("--tau-out must be in [0, 1].")
+    if args.hard_negative_topk <= 0:
+        raise ValueError("--hard-negative-topk must be > 0.")
     if (args.inner_decay_start_epoch is None) != (args.inner_decay_end_epoch is None):
         raise ValueError("--inner-decay-start-epoch and --inner-decay-end-epoch must be set together.")
     if args.inner_decay_start_epoch is not None and args.inner_decay_end_epoch <= args.inner_decay_start_epoch:
@@ -522,10 +553,14 @@ def main() -> None:
                 "main_loss",
                 "inner_loss",
                 "outer_loss",
+                "hn_loss",
+                "tv_loss",
                 "inner_mean",
                 "outer_mean",
                 "inner_weighted",
                 "outer_weighted",
+                "hn_weighted",
+                "tv_weighted",
                 primary_iou_key,
             ],
         )
@@ -559,10 +594,14 @@ def main() -> None:
             row["main_loss"] = f"{train_stats['main_loss']:.4f}"
             row["inner_loss"] = f"{train_stats['inner_loss']:.4f}"
             row["outer_loss"] = f"{train_stats['outer_loss']:.4f}"
+            row["hn_loss"] = f"{train_stats['hn_loss']:.4f}"
+            row["tv_loss"] = f"{train_stats['tv_loss']:.4f}"
             row["inner_mean"] = f"{train_stats['inner_mean']:.4f}"
             row["outer_mean"] = f"{train_stats['outer_mean']:.4f}"
             row["inner_weighted"] = f"{train_stats['inner_weighted']:.4f}"
             row["outer_weighted"] = f"{train_stats['outer_weighted']:.4f}"
+            row["hn_weighted"] = f"{train_stats['hn_weighted']:.4f}"
+            row["tv_weighted"] = f"{train_stats['tv_weighted']:.4f}"
 
             ran_eval = should_run(epoch, args.eval_every) or epoch == args.epochs
             if ran_eval:
@@ -603,7 +642,11 @@ def main() -> None:
                 f"inner={train_stats['inner_loss']:.4f} "
                 f"inner_w={train_stats['inner_weighted']:.4f} "
                 f"outer={train_stats['outer_loss']:.4f} "
-                f"outer_w={train_stats['outer_weighted']:.4f}"
+                f"outer_w={train_stats['outer_weighted']:.4f} "
+                f"hn={train_stats['hn_loss']:.4f} "
+                f"hn_w={train_stats['hn_weighted']:.4f} "
+                f"tv={train_stats['tv_loss']:.4f} "
+                f"tv_w={train_stats['tv_weighted']:.4f}"
             )
             if ran_eval:
                 message += f" {primary_iou_key}={epoch_iou:.2f}"
